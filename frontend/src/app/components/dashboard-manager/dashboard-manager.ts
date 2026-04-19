@@ -1,14 +1,17 @@
 import { Component, ChangeDetectorRef, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
-import { NgTemplateOutlet, TitleCasePipe } from '@angular/common';
+import { NgTemplateOutlet, TitleCasePipe, DecimalPipe } from '@angular/common';
+import { DomSanitizer, SafeResourceUrl } from '@angular/platform-browser';
 import { ApiService } from '../../services/api.service';
 import { AuthService } from '../../services/user-auth.service';
+import { ThemeService } from '../../services/theme.service';
+import { esportaExcel } from '../../utils/excel-export';
 
 type Section = 'dashboard' | 'utenti' | 'stazioni' | 'richieste';
 
 @Component({
   selector: 'app-dashboard-manager',
-  imports: [FormsModule, NgTemplateOutlet, TitleCasePipe],
+  imports: [FormsModule, NgTemplateOutlet, TitleCasePipe, DecimalPipe],
   templateUrl: './dashboard-manager.html',
   styleUrl: '../../app.css',
 })
@@ -30,11 +33,17 @@ export class DashboardManager implements OnInit {
 
   showModal  = false;
   modalError: string | null = null;
-  newUser    = { email: '', nome: '', cognome: '', birthdate: '', codice_fiscale: '', data_assunzione: '', termine_contratto: '', ruolo: 'employee' };
+  newUser    = { email: '', nome: '', cognome: '', birthdate: '', codice_fiscale: '', ruolo: 'employee' };
 
   showEditModal     = false;
   editUser: any     = {};
   showDeleteConfirm = false;
+
+  resetPasswordLoading = false;
+  resetPasswordMessage: string | null = null;
+
+  resetBiometricsLoading = false;
+  resetBiometricsMessage: string | null = null;
 
   // ─── Richieste ────────────────────────────────────────────────────────────
   richieste:          any[] = [];
@@ -62,6 +71,18 @@ export class DashboardManager implements OnInit {
   stazioneToDelete:   any   = null;
   showDeleteStazioneConfirm = false;
 
+  // ─── Contratti ────────────────────────────────────────────────────────────
+  contratti:              any[] = [];
+  contrattiLoading              = false;
+  dettagliUtenteOpen            = false;
+  contrattoOpen                 = false;
+  showContrattoModal            = false;
+  contrattoModalError: string | null = null;
+  newContratto: any             = {};
+  showEditContrattoModal        = false;
+  editContratto: any            = {};
+  editContrattoId               = '';
+
   // ─── Timbrature ───────────────────────────────────────────────────────────
   timbrature:    any[]  = [];
   timbratureLoading     = false;
@@ -69,7 +90,7 @@ export class DashboardManager implements OnInit {
   meseSelezionato: number | null = new Date().getMonth() + 1;
   readonly mesi = ['Gennaio', 'Febbraio', 'Marzo', 'Aprile', 'Maggio', 'Giugno', 'Luglio', 'Agosto', 'Settembre', 'Ottobre', 'Novembre', 'Dicembre'];
 
-  constructor(private apiService: ApiService, public authService: AuthService, private cdr: ChangeDetectorRef) {}
+  constructor(private apiService: ApiService, public authService: AuthService, private cdr: ChangeDetectorRef, public themeService: ThemeService, private sanitizer: DomSanitizer) {}
 
   ngOnInit() { this.loadDashboard(); }
 
@@ -147,16 +168,23 @@ export class DashboardManager implements OnInit {
         this.selectedUser = data;
         this.resetPeriodoTimbrature();
         this.loadTimbrature(data.id);
+        this.loadContratti(data.id);
         this.cdr.detectChanges();
       },
       error: (err) => console.error('Errore caricamento utente:', err),
     });
   }
 
-  backToList() { this.selectedUser = null; this.timbrature = []; }
+  backToList() {
+    this.selectedUser       = null;
+    this.timbrature         = [];
+    this.contratti          = [];
+    this.dettagliUtenteOpen = false;
+    this.contrattoOpen      = false;
+  }
 
   openModal() {
-    this.newUser    = { email: '', nome: '', cognome: '', birthdate: '', codice_fiscale: '', data_assunzione: '', termine_contratto: '', ruolo: 'employee' };
+    this.newUser    = { email: '', nome: '', cognome: '', birthdate: '', codice_fiscale: '', ruolo: 'employee' };
     this.modalError = null;
     this.showModal  = true;
   }
@@ -173,12 +201,10 @@ export class DashboardManager implements OnInit {
 
   openEditModal() {
     this.editUser = {
-      nome:              this.selectedUser.given_name,
-      cognome:           this.selectedUser.family_name,
-      birthdate:         this.selectedUser.birthdate         ?? '',
-      codice_fiscale:    this.selectedUser.codice_fiscale    ?? '',
-      data_assunzione:   this.selectedUser.data_assunzione   ?? '',
-      termine_contratto: this.selectedUser.termine_contratto ?? '',
+      nome:           this.selectedUser.given_name,
+      cognome:        this.selectedUser.family_name,
+      birthdate:      this.selectedUser.birthdate      ?? '',
+      codice_fiscale: this.selectedUser.codice_fiscale ?? '',
     };
     this.showEditModal = true;
   }
@@ -187,6 +213,46 @@ export class DashboardManager implements OnInit {
     this.apiService.modifyUser(this.selectedUser.id, this.editUser).subscribe({
       next: () => { this.showEditModal = false; this.cdr.detectChanges(); this.selectUser({ id: this.selectedUser.id }); },
       error: (err) => console.error('Errore modifica utente:', err),
+    });
+  }
+
+  resetPasswordDipendente() {
+    if (!confirm(`Inviare una password temporanea via email a ${this.selectedUser?.email}?`)) return;
+    this.resetPasswordLoading = true;
+    this.resetPasswordMessage = null;
+    this.apiService.resetPassword(this.selectedUser.id).subscribe({
+      next: () => {
+        this.resetPasswordLoading = false;
+        this.resetPasswordMessage = 'Password temporanea inviata via email.';
+        this.cdr.detectChanges();
+        setTimeout(() => { this.resetPasswordMessage = null; this.cdr.detectChanges(); }, 4000);
+      },
+      error: (err) => {
+        this.resetPasswordLoading = false;
+        this.resetPasswordMessage = err.error?.message ?? 'Errore durante il reset';
+        this.cdr.detectChanges();
+      },
+    });
+  }
+
+  resetBiometricsDipendente() {
+    const nome = `${this.selectedUser?.given_name ?? ''} ${this.selectedUser?.family_name ?? ''}`.trim();
+    if (!confirm(`Resettare la biometria di ${nome}? Le credenziali WebAuthn verranno cancellate definitivamente.`)) return;
+    this.resetBiometricsLoading = true;
+    this.resetBiometricsMessage = null;
+    this.apiService.resetBiometrics(this.selectedUser.id).subscribe({
+      next: () => {
+        this.resetBiometricsLoading = false;
+        this.resetBiometricsMessage = 'Biometria resettata. Al prossimo login l\'utente dovrà registrare il dispositivo.';
+        this.selectUser({ id: this.selectedUser.id }); // ricarica per aggiornare il badge
+        this.cdr.detectChanges();
+        setTimeout(() => { this.resetBiometricsMessage = null; this.cdr.detectChanges(); }, 5000);
+      },
+      error: (err) => {
+        this.resetBiometricsLoading = false;
+        this.resetBiometricsMessage = err.error?.message ?? 'Errore durante il reset';
+        this.cdr.detectChanges();
+      },
     });
   }
 
@@ -205,6 +271,105 @@ export class DashboardManager implements OnInit {
   }
 
 
+  // ─── Contratti ────────────────────────────────────────────────────────────
+
+  loadContratti(userId: string) {
+    this.contrattiLoading = true;
+    this.contratti        = [];
+    this.apiService.getContracts(userId).subscribe({
+      next: (data) => { this.contratti = data; this.contrattiLoading = false; this.cdr.detectChanges(); },
+      error: (err)  => { console.error('Errore contratti:', err); this.contrattiLoading = false; this.cdr.detectChanges(); },
+    });
+  }
+
+  get contrattoAttivo(): any | null { return this.contratti[0] ?? null; }
+
+  openNuovoContrattoModal() {
+    this.newContratto        = { userId: this.selectedUser.id, tipoContratto: 'indeterminato', dataInizio: '' };
+    this.contrattoModalError = null;
+    this.showContrattoModal  = true;
+  }
+
+  closeContrattoModal() { this.showContrattoModal = false; this.contrattoModalError = null; }
+
+  onTipoContrattoChange(c: any) {
+    if (c.tipoContratto === 'indeterminato') delete c.dataFine;
+  }
+
+  private validateContratto(c: any): string | null {
+    if (!c.dataInizio) return 'La data di inizio è obbligatoria';
+    if (c.tipoContratto !== 'indeterminato' && c.dataFine && c.dataFine < c.dataInizio)
+      return 'La data di fine deve essere successiva alla data di inizio';
+    if (c.oreSett != null && c.oreSett !== '') {
+      const v = Number(c.oreSett);
+      if (v <= 0 || v > 80) return 'Le ore settimanali devono essere tra 1 e 80';
+    }
+    if (c.giorniSett != null && c.giorniSett !== '') {
+      const v = Number(c.giorniSett);
+      if (v < 1 || v > 7 || !Number.isInteger(v)) return 'I giorni settimanali devono essere tra 1 e 7';
+    }
+    if (c.retribuzioneLorda != null && c.retribuzioneLorda !== '') {
+      if (Number(c.retribuzioneLorda) <= 0) return 'La retribuzione lorda deve essere maggiore di zero';
+    }
+    if (c.retribuzioneNetta != null && c.retribuzioneNetta !== '') {
+      if (Number(c.retribuzioneNetta) <= 0) return 'La retribuzione netta deve essere maggiore di zero';
+      if (c.retribuzioneLorda != null && c.retribuzioneLorda !== '' && Number(c.retribuzioneNetta) > Number(c.retribuzioneLorda))
+        return 'La retribuzione netta non può superare quella lorda';
+    }
+    if (c.periodoDiProva != null && c.periodoDiProva !== '') {
+      const v = Number(c.periodoDiProva);
+      if (v < 0 || v > 24) return 'Il periodo di prova deve essere tra 0 e 24 mesi';
+    }
+    if (c.giorniFerie != null && c.giorniFerie !== '') {
+      const v = Number(c.giorniFerie);
+      if (v < 0 || v > 365) return 'I giorni di ferie devono essere tra 0 e 365';
+    }
+    if (c.permessiOre != null && c.permessiOre !== '') {
+      if (Number(c.permessiOre) < 0) return 'Le ore di permesso non possono essere negative';
+    }
+    return null;
+  }
+
+  salvaContratto() {
+    const err = this.validateContratto(this.newContratto);
+    if (err) { this.contrattoModalError = err; return; }
+    this.contrattoModalError = null;
+    this.apiService.createContract(this.newContratto).subscribe({
+      next: () => { this.closeContrattoModal(); this.loadContratti(this.selectedUser.id); },
+      error: (err) => { this.contrattoModalError = err.error?.message ?? 'Errore durante la creazione'; this.cdr.detectChanges(); },
+    });
+  }
+
+  openEditContrattoModal(c: any) {
+    this.editContrattoId     = c.contractId;
+    this.editContratto       = { ...c };
+    this.contrattoModalError = null;
+    this.showEditContrattoModal = true;
+  }
+
+  salvaModificaContratto() {
+    const err = this.validateContratto(this.editContratto);
+    if (err) { this.contrattoModalError = err; return; }
+    this.contrattoModalError = null;
+    const { contractId, userId, createdAt, ...payload } = this.editContratto;
+    this.apiService.updateContract(this.editContrattoId, payload).subscribe({
+      next: () => { this.showEditContrattoModal = false; this.loadContratti(this.selectedUser.id); },
+      error: (err) => { this.contrattoModalError = err.error?.message ?? 'Errore durante la modifica'; this.cdr.detectChanges(); },
+    });
+  }
+
+  eliminaContratto(contractId: string) {
+    this.apiService.deleteContract(contractId).subscribe({
+      next: () => this.loadContratti(this.selectedUser.id),
+      error: (err) => console.error('Errore eliminazione contratto:', err),
+    });
+  }
+
+  tipoContrattoLabel(tipo: string): string {
+    return { indeterminato: 'Indeterminato', determinato: 'Determinato', part_time: 'Part-time', apprendistato: 'Apprendistato', stage: 'Stage' }[tipo] ?? tipo;
+  }
+
+
   // ─── Richieste ────────────────────────────────────────────────────────────
 
   loadRichieste() {
@@ -220,15 +385,18 @@ export class DashboardManager implements OnInit {
     this.approvaModalRichiesta       = r;
     this.approvaModalTimbrature      = [];
     this.approvaModalAltreRichieste  = [];
-    this.approvaModalLoading         = true;
+    this.approvaModalLoading         = false;
     this.approvaModalError           = null;
     this.showApprovaModal            = true;
+
+    if (r.tipoRichiesta === 'reset_biometria') return;
 
     // Altre richieste pendenti dello stesso utente per lo stesso giorno
     this.approvaModalAltreRichieste = this.richieste.filter(
       p => p.requestId !== r.requestId && p.userId === r.userId && p.data === r.data
     ).sort((a: any, b: any) => a.ora.localeCompare(b.ora));
 
+    this.approvaModalLoading = true;
     const mese = r.data.slice(0, 7);
     this.apiService.getTimbratureUtente(r.userId, mese).subscribe({
       next: (data) => {
@@ -471,33 +639,50 @@ export class DashboardManager implements OnInit {
   scaricaTimbratureExcel() {
     if (this.timbrature.length === 0) return;
 
-    const nomeUtente = `${this.selectedUser?.given_name ?? ''} ${this.selectedUser?.family_name ?? ''}`.trim();
+    const u    = this.selectedUser;
+    const c    = this.contrattoAttivo;
+    const nome = `${u?.given_name ?? ''} ${u?.family_name ?? ''}`.trim();
     const mm   = this.meseSelezionato ? `-${String(this.meseSelezionato).padStart(2, '0')}` : '-annuale';
-    const slug = nomeUtente.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+    const slug = nome.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
 
-    const riepilogo = [
-      ['Dipendente',      this.escapeCsv(nomeUtente)],
-      ['Periodo',         this.escapeCsv(this.periodoLabel)],
-      ['Ore lavorate',    this.escapeCsv(this.oreLavorate)],
-      ['Giorni lavorati', this.escapeCsv(String(this.giorniLavorati))],
-      ['Media giornaliera', this.escapeCsv(this.mediaGiornaliera)],
-      [],
-    ].map(r => r.join(';'));
+    let analisi = undefined;
+    if (c?.oreSett) {
+      const minutiLavorati = this.calcolaMinutiLavorati(this.timbrature);
+      const giorniLavAtt   = this.countWorkingDays(this.annoSelezionato, this.meseSelezionato);
+      const minutiAttesi   = Math.round(giorniLavAtt * (c.oreSett / (c.giorniSett ?? 5)) * 60);
+      const minutiStraord  = Math.max(0, minutiLavorati - minutiAttesi);
+      const minutiMancanti = Math.max(0, minutiAttesi - minutiLavorati);
+      const retribOraria   = c.retribuzioneLorda ? c.retribuzioneLorda / (c.oreSett * 52 / 12) : null;
+      analisi = {
+        giorniLavAtt, minutiAttesi, minutiLavorati,
+        minutiStraord, minutiMancanti, retribOraria,
+        importoStraord: retribOraria ? (minutiStraord / 60) * retribOraria : null,
+      };
+    }
 
-    const intestazione = ['Data', 'Entrata', 'Uscita', 'Durata', 'Sede'];
-    const righe = this.turni.map(t =>
-      [t.data, t.entrata, t.uscita ?? '—', t.durata ?? '—', t.sede].map(v => this.escapeCsv(v))
-    );
-
-    const csv  = ['\ufeff' + riepilogo.join('\n'), intestazione.join(';'), ...righe.map(r => r.join(';'))].join('\n');
-    const blob = new Blob([csv], { type: 'application/vnd.ms-excel;charset=utf-8;' });
-    const link = document.createElement('a');
-    link.href  = URL.createObjectURL(blob);
-    link.download = `timbrature-${slug}-${this.annoSelezionato}${mm}.xls`;
-    link.click();
-    URL.revokeObjectURL(link.href);
+    esportaExcel({
+      nome,
+      email:         u?.email,
+      codiceFiscale: u?.codice_fiscale,
+      contratto:     c,
+      stats: {
+        periodoLabel:     this.periodoLabel,
+        oreLavorate:      this.oreLavorate,
+        giorniLavorati:   this.giorniLavorati,
+        mediaGiornaliera: this.mediaGiornaliera,
+        formatDurata:     (m: number) => this.formatDurata(m),
+      },
+      analisi,
+      presenze: this.turni.map(t => ({
+        data: t.data, entrata: t.entrata, uscita: t.uscita,
+        durata: t.durata, oreDecimali: this.durataToDecimal(t.durata), sede: t.sede,
+      })),
+      filename: `timbrature-${slug}-${this.annoSelezionato}${mm}.xlsx`,
+    });
   }
 
+
+  // ─── Audit Trail ──────────────────────────────────────────────────────────
 
   // ─── Utility ──────────────────────────────────────────────────────────────
 
@@ -507,6 +692,12 @@ export class DashboardManager implements OnInit {
       data: d.toLocaleDateString('it-IT'),
       ora:  d.toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' }),
     };
+  }
+
+  stazioneMapUrl(lat: number, lng: number): SafeResourceUrl {
+    const delta = 0.005;
+    const url = `https://www.openstreetmap.org/export/embed.html?bbox=${lng - delta},${lat - delta},${lng + delta},${lat + delta}&layer=mapnik&marker=${lat},${lng}`;
+    return this.sanitizer.bypassSecurityTrustResourceUrl(url);
   }
 
   private getPeriodoApi(): string {
@@ -527,7 +718,26 @@ export class DashboardManager implements OnInit {
     return h > 0 ? `${h}h ${m}min` : `${m}min`;
   }
 
-  private escapeCsv(value: string): string {
-    return `"${value.replace(/"/g, '""')}"`;
+  private durataToDecimal(durata: string | null): string {
+    if (!durata) return '';
+    const h = durata.match(/(\d+)h/);
+    const m = durata.match(/(\d+)min/);
+    const tot = (h ? parseInt(h[1]) * 60 : 0) + (m ? parseInt(m[1]) : 0);
+    return (tot / 60).toFixed(2).replace('.', ',');
   }
+
+  private countWorkingDays(anno: number, mese: number | null): number {
+    if (mese == null) {
+      return Array.from({ length: 12 }, (_, i) => this.countWorkingDays(anno, i + 1))
+                  .reduce((a, b) => a + b, 0);
+    }
+    let count = 0;
+    const days = new Date(anno, mese, 0).getDate();
+    for (let d = 1; d <= days; d++) {
+      const dow = new Date(anno, mese - 1, d).getDay();
+      if (dow !== 0 && dow !== 6) count++;
+    }
+    return count;
+  }
+
 }

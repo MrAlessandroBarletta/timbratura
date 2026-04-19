@@ -114,6 +114,25 @@ export class ApiConfig extends Construct {
     requestId.addResource('reject').addMethod('POST',  new apigateway.LambdaIntegration(handler), cognitoOpts); // Rifiuta (manager)
   }
 
+  // Aggiunge le rotte /contracts — tutte protette da Cognito
+  // Manager: CRUD completo + lista per userId
+  // Employee: sola lettura dei propri contratti via /contracts/me
+  public addContractsRoutes(handler: lambda.IFunction) {
+    const cognitoOpts = { authorizer: this.authorizer, authorizationType: apigateway.AuthorizationType.COGNITO };
+
+    const contracts = this.api.root.addResource('contracts');
+    contracts.addMethod('POST', new apigateway.LambdaIntegration(handler), cognitoOpts); // Crea contratto (manager)
+    contracts.addMethod('GET',  new apigateway.LambdaIntegration(handler), cognitoOpts); // Lista contratti per userId (manager)
+
+    contracts.addResource('me')
+      .addMethod('GET', new apigateway.LambdaIntegration(handler), cognitoOpts);         // Miei contratti (employee)
+
+    const contractId = contracts.addResource('{id}');
+    contractId.addMethod('GET',    new apigateway.LambdaIntegration(handler), cognitoOpts); // Dettaglio contratto
+    contractId.addMethod('PUT',    new apigateway.LambdaIntegration(handler), cognitoOpts); // Modifica contratto (manager)
+    contractId.addMethod('DELETE', new apigateway.LambdaIntegration(handler), cognitoOpts); // Elimina contratto (manager)
+  }
+
   // Aggiunge tutte le rotte /users protette, collegate alla stessa lambda
   public addUsersRoutes(handler: lambda.IFunction) {
     const opts = {
@@ -135,5 +154,8 @@ export class ApiConfig extends Construct {
     user.addMethod('GET',    new apigateway.LambdaIntegration(handler), opts); // Dettaglio dipendente
     user.addMethod('PUT',    new apigateway.LambdaIntegration(handler), opts); // Modifica dipendente
     user.addMethod('DELETE', new apigateway.LambdaIntegration(handler), opts); // Elimina dipendente
+    user.addResource('reset-password').addMethod('POST', new apigateway.LambdaIntegration(handler), opts);   // Invia password temporanea (manager)
+    user.addResource('reset-biometrics').addMethod('POST', new apigateway.LambdaIntegration(handler), opts); // Reset diretto biometria (manager)
   }
 }
+

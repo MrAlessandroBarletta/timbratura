@@ -15,12 +15,17 @@ export class DynamoDbConfig extends Construct {
   // Tabella che memorizza le richieste di timbratura manuale
   public readonly requestsTable: dynamodb.Table;
 
+  // Tabella che memorizza i contratti di lavoro dei dipendenti
+  public readonly contractsTable: dynamodb.Table;
+
   constructor(scope: Construct, id: string, suffix: string = '') {
     super(scope, id);
 
+    // Creazione della tabella per le credenziali WebAuthn
     this.webAuthnTable = new dynamodb.Table(this, 'WebAuthnCredentials', {
       tableName:    `WebAuthnCredentials${suffix}`,
       partitionKey: { name: 'credentialId', type: dynamodb.AttributeType.STRING },
+      billingMode:  dynamodb.BillingMode.PAY_PER_REQUEST,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
     this.webAuthnTable.addGlobalSecondaryIndex({
@@ -29,12 +34,14 @@ export class DynamoDbConfig extends Construct {
     });
     new cdk.CfnOutput(this, 'WebAuthnTableName', { value: this.webAuthnTable.tableName });
 
+    // Creazione della tabella per le stazioni di timbratura
     this.stazioniTable = new dynamodb.Table(this, 'Stazioni', {
       tableName: `Stazioni${suffix}`,
 
       // stationId è la chiave primaria — UUID generato alla creazione
       partitionKey: { name: 'stationId', type: dynamodb.AttributeType.STRING },
 
+      billingMode:  dynamodb.BillingMode.PAY_PER_REQUEST,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
@@ -56,6 +63,7 @@ export class DynamoDbConfig extends Construct {
       partitionKey: { name: 'userId',    type: dynamodb.AttributeType.STRING },
       sortKey:      { name: 'timestamp', type: dynamodb.AttributeType.STRING },
 
+      billingMode:  dynamodb.BillingMode.PAY_PER_REQUEST,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
@@ -74,6 +82,7 @@ export class DynamoDbConfig extends Construct {
     this.requestsTable = new dynamodb.Table(this, 'Requests', {
       tableName:    `Requests${suffix}`,
       partitionKey: { name: 'requestId', type: dynamodb.AttributeType.STRING },
+      billingMode:  dynamodb.BillingMode.PAY_PER_REQUEST,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
@@ -92,5 +101,21 @@ export class DynamoDbConfig extends Construct {
     });
 
     new cdk.CfnOutput(this, 'RequestsTableName', { value: this.requestsTable.tableName });
+
+    this.contractsTable = new dynamodb.Table(this, 'Contracts', {
+      tableName:    `Contracts${suffix}`,
+      partitionKey: { name: 'contractId', type: dynamodb.AttributeType.STRING },
+      billingMode:  dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    // GSI su userId — recupera tutti i contratti di un dipendente ordinati per data di inizio
+    this.contractsTable.addGlobalSecondaryIndex({
+      indexName:    'userId-index',
+      partitionKey: { name: 'userId',     type: dynamodb.AttributeType.STRING },
+      sortKey:      { name: 'dataInizio', type: dynamodb.AttributeType.STRING },
+    });
+
+    new cdk.CfnOutput(this, 'ContractsTableName', { value: this.contractsTable.tableName });
   }
 }

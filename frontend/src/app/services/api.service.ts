@@ -18,6 +18,8 @@ export class ApiService {
   getUsers(): Observable<any> { return this.http.get(`${this.apiUrl}/users`); }
   markPasswordChanged(): Observable<any>      { return this.http.post(`${this.apiUrl}/users/password-changed`, {}); }
   markBiometricsRegistered(): Observable<any> { return this.http.post(`${this.apiUrl}/users/biometrics-registered`, {}); }
+  resetPassword(userId: string): Observable<any>    { return this.http.post(`${this.apiUrl}/users/${userId}/reset-password`, {}); }
+  resetBiometrics(userId: string): Observable<any>  { return this.http.post(`${this.apiUrl}/users/${userId}/reset-biometrics`, {}); }
 
   // --- Biometric Registration ---
   startBiometricRegistration(): Observable<any>                    { return this.http.post(`${this.apiUrl}/biometric/registration/start`, {}); }
@@ -29,7 +31,7 @@ export class ApiService {
   // --- Timbrature ---
   registraTimbratura(data: any): Observable<any>              { return this.http.post(`${this.apiUrl}/timbrature`, data); }
   anteprimaTimbratura(data: any): Observable<any>             { return this.http.post(`${this.apiUrl}/timbrature/anteprima`, data); }
-  confermaTimbratura(confirmToken: string): Observable<any>   { return this.http.post(`${this.apiUrl}/timbrature/conferma`, { confirmToken }); }
+  confermaTimbratura(confirmToken: string, tipoOverride?: string): Observable<any> { return this.http.post(`${this.apiUrl}/timbrature/conferma`, { confirmToken, tipoOverride }); }
   getMieTimbrature(mese?: string): Observable<any>            { return this.http.get(`${this.apiUrl}/timbrature/me${mese ? '?mese=' + mese : ''}`); }
   getDashboardOggi(): Observable<any>                         { return this.http.get(`${this.apiUrl}/timbrature/dashboard`); }
   getTimbratureUtente(userId: string, mese?: string): Observable<any> {
@@ -48,9 +50,17 @@ export class ApiService {
   getStazioneQr(): Observable<{ qrUrl: string; expiresAt: number; presenti: number; lat: number | null; lng: number | null; ultimaTimbratura: any | null }> { return this.http.get<any>(`${this.apiUrl}/stazioni/me/qr`); }
   updateStazionePosition(lat: number, lng: number): Observable<any> { return this.http.post(`${this.apiUrl}/stazioni/me/position`, { lat, lng }); }
 
+  // --- Contracts ---
+  getContracts(userId: string): Observable<any>              { return this.http.get(`${this.apiUrl}/contracts?userId=${userId}`); }
+  getMyContracts(): Observable<any>                          { return this.http.get(`${this.apiUrl}/contracts/me`); }
+  createContract(data: any): Observable<any>                 { return this.http.post(`${this.apiUrl}/contracts`, data); }
+  updateContract(id: string, data: any): Observable<any>     { return this.http.put(`${this.apiUrl}/contracts/${id}`, data); }
+  deleteContract(id: string): Observable<any>                { return this.http.delete(`${this.apiUrl}/contracts/${id}`); }
+
   // --- Stazioni CRUD (Cognito manager) ---
   getStazioni(): Observable<any>              { return this.http.get(`${this.apiUrl}/stazioni`); }
   getStazione(id: string): Observable<any>    { return this.http.get(`${this.apiUrl}/stazioni/${id}`); }
   createStazione(data: any): Observable<any>  { return this.http.post(`${this.apiUrl}/stazioni`, data); }
   deleteStazione(id: string): Observable<any> { return this.http.delete(`${this.apiUrl}/stazioni/${id}`); }
-} 
+
+}

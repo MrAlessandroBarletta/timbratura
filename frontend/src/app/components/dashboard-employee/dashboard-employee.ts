@@ -1,12 +1,14 @@
-import { Component, ChangeDetectorRef, OnInit } from '@angular/core';
+import { Component, ChangeDetectorRef, OnInit, inject } from '@angular/core';
 import { FormsModule } from '@angular/forms';
-import { TitleCasePipe } from '@angular/common';
+import { TitleCasePipe, DecimalPipe } from '@angular/common';
 import { ApiService } from '../../services/api.service';
 import { AuthService } from '../../services/user-auth.service';
+import { ThemeService } from '../../services/theme.service';
+import { esportaExcel } from '../../utils/excel-export';
 
 @Component({
   selector: 'app-dashboard-employee',
-  imports: [FormsModule, TitleCasePipe],
+  imports: [FormsModule, TitleCasePipe, DecimalPipe],
   templateUrl: './dashboard-employee.html',
   styleUrl: '../../app.css',
 })
@@ -15,6 +17,12 @@ export class DashboardEmployee implements OnInit {
   // ─── Profilo ──────────────────────────────────────────────────────────────
   profile: any = null;
   profileLoading = false;
+
+  // ─── Contratto ────────────────────────────────────────────────────────────
+  contratti: any[]     = [];
+  contrattiLoading     = false;
+  dettagliUtenteOpen   = false;
+  contrattoOpen        = false;
 
   // ─── Timbrature ───────────────────────────────────────────────────────────
   timbrature: any[]  = [];
@@ -30,7 +38,14 @@ export class DashboardEmployee implements OnInit {
   requestModalError: string | null = null;
   newRequest          = { data: '', tipo: 'entrata', ora: '', nota: '' };
 
-  constructor(private apiService: ApiService, public authService: AuthService, private cdr: ChangeDetectorRef) {}
+  showResetBiometriaModal = false;
+  resetBiometriaNote      = '';
+  resetBiometriaError: string | null = null;
+
+  private apiService  = inject(ApiService);
+  public authService  = inject(AuthService);
+  private cdr         = inject(ChangeDetectorRef);
+  public themeService = inject(ThemeService);
 
   ngOnInit() {
     // Aspetta che la sessione Cognito sia caricata prima di caricare il profilo
@@ -51,10 +66,28 @@ export class DashboardEmployee implements OnInit {
         this.profileLoading = false;
         this.loadTimbrature();
         this.loadMieRequests();
+        this.loadMioContratto();
         this.cdr.detectChanges();
       },
       error: (err) => { console.error('[employee] errore profilo:', err); this.profileLoading = false; this.cdr.detectChanges(); },
     });
+  }
+
+
+  // ─── Contratto ────────────────────────────────────────────────────────────
+
+  loadMioContratto() {
+    this.contrattiLoading = true;
+    this.apiService.getMyContracts().subscribe({
+      next: (data) => { this.contratti = data; this.contrattiLoading = false; this.cdr.detectChanges(); },
+      error: (err)  => { console.error('Errore contratto:', err); this.contrattiLoading = false; this.cdr.detectChanges(); },
+    });
+  }
+
+  get contrattoAttivo(): any | null { return this.contratti[0] ?? null; }
+
+  tipoContrattoLabel(tipo: string): string {
+    return { indeterminato: 'Indeterminato', determinato: 'Determinato', part_time: 'Part-time', apprendistato: 'Apprendistato', stage: 'Stage' }[tipo] ?? tipo;
   }
 
 
@@ -208,31 +241,46 @@ export class DashboardEmployee implements OnInit {
   scaricaTimbratureExcel() {
     if (this.timbrature.length === 0) return;
 
-    const nomeUtente = `${this.profile?.given_name ?? ''} ${this.profile?.family_name ?? ''}`.trim();
+    const u    = this.profile;
+    const c    = this.contrattoAttivo;
+    const nome = `${u?.given_name ?? ''} ${u?.family_name ?? ''}`.trim();
     const mm   = this.meseSelezionato ? `-${String(this.meseSelezionato).padStart(2, '0')}` : '-annuale';
-    const slug = nomeUtente.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+    const slug = nome.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
 
-    const riepilogo = [
-      ['Dipendente',      this.escapeCsv(nomeUtente)],
-      ['Periodo',         this.escapeCsv(this.periodoLabel)],
-      ['Ore lavorate',    this.escapeCsv(this.oreLavorate)],
-      ['Giorni lavorati', this.escapeCsv(String(this.giorniLavorati))],
-      ['Media giornaliera', this.escapeCsv(this.mediaGiornaliera)],
-      [],
-    ].map(r => r.join(';'));
+    let analisi = undefined;
+    if (c?.oreSett) {
+      const minutiLavorati = this.calcolaMinutiLavorati(this.timbrature);
+      const giorniLavAtt   = this.countWorkingDays(this.annoSelezionato, this.meseSelezionato);
+      const minutiAttesi   = Math.round(giorniLavAtt * (c.oreSett / (c.giorniSett ?? 5)) * 60);
+      const minutiStraord  = Math.max(0, minutiLavorati - minutiAttesi);
+      const minutiMancanti = Math.max(0, minutiAttesi - minutiLavorati);
+      const retribOraria   = c.retribuzioneLorda ? c.retribuzioneLorda / (c.oreSett * 52 / 12) : null;
+      analisi = {
+        giorniLavAtt, minutiAttesi, minutiLavorati,
+        minutiStraord, minutiMancanti, retribOraria,
+        importoStraord: retribOraria ? (minutiStraord / 60) * retribOraria : null,
+      };
+    }
 
-    const intestazione = ['Data', 'Entrata', 'Uscita', 'Durata', 'Sede'];
-    const righe = this.turni.map(t =>
-      [t.data, t.entrata, t.uscita ?? '—', t.durata ?? '—', t.sede].map(v => this.escapeCsv(v))
-    );
-
-    const csv  = ['\ufeff' + riepilogo.join('\n'), intestazione.join(';'), ...righe.map(r => r.join(';'))].join('\n');
-    const blob = new Blob([csv], { type: 'application/vnd.ms-excel;charset=utf-8;' });
-    const link = document.createElement('a');
-    link.href  = URL.createObjectURL(blob);
-    link.download = `timbrature-${slug}-${this.annoSelezionato}${mm}.xls`;
-    link.click();
-    URL.revokeObjectURL(link.href);
+    esportaExcel({
+      nome,
+      email:         u?.email,
+      codiceFiscale: u?.codice_fiscale,
+      contratto:     c,
+      stats: {
+        periodoLabel:     this.periodoLabel,
+        oreLavorate:      this.oreLavorate,
+        giorniLavorati:   this.giorniLavorati,
+        mediaGiornaliera: this.mediaGiornaliera,
+        formatDurata:     (m: number) => this.formatDurata(m),
+      },
+      analisi,
+      presenze: this.turni.map(t => ({
+        data: t.data, entrata: t.entrata, uscita: t.uscita,
+        durata: t.durata, oreDecimali: this.durataToDecimal(t.durata), sede: t.sede,
+      })),
+      filename: `timbrature-${slug}-${this.annoSelezionato}${mm}.xlsx`,
+    });
   }
 
 
@@ -270,6 +318,23 @@ export class DashboardEmployee implements OnInit {
     return { pendente: 'In attesa', approvata: 'Approvata', rifiutata: 'Rifiutata' }[stato] ?? stato;
   }
 
+  openResetBiometriaModal() {
+    this.resetBiometriaNote  = '';
+    this.resetBiometriaError = null;
+    this.showResetBiometriaModal = true;
+  }
+
+  closeResetBiometriaModal() { this.showResetBiometriaModal = false; this.resetBiometriaError = null; }
+
+  inviaResetBiometria() {
+    if (!this.resetBiometriaNote.trim()) { this.resetBiometriaError = 'Il motivo è obbligatorio'; return; }
+    this.resetBiometriaError = null;
+    this.apiService.creaRequest({ tipoRichiesta: 'reset_biometria', nota: this.resetBiometriaNote.trim() }).subscribe({
+      next: () => { this.closeResetBiometriaModal(); this.loadMieRequests(); },
+      error: (err) => { this.resetBiometriaError = err.error?.message ?? 'Errore durante l\'invio'; this.cdr.detectChanges(); },
+    });
+  }
+
 
   // ─── Utility ──────────────────────────────────────────────────────────────
 
@@ -293,7 +358,26 @@ export class DashboardEmployee implements OnInit {
     return h > 0 ? `${h}h ${m}min` : `${m}min`;
   }
 
-  private escapeCsv(value: string): string {
-    return `"${value.replace(/"/g, '""')}"`;
+  private durataToDecimal(durata: string | null): string {
+    if (!durata) return '';
+    const h = durata.match(/(\d+)h/);
+    const m = durata.match(/(\d+)min/);
+    const tot = (h ? parseInt(h[1]) * 60 : 0) + (m ? parseInt(m[1]) : 0);
+    return (tot / 60).toFixed(2).replace('.', ',');
   }
+
+  private countWorkingDays(anno: number, mese: number | null): number {
+    if (mese == null) {
+      return Array.from({ length: 12 }, (_, i) => this.countWorkingDays(anno, i + 1))
+                  .reduce((a, b) => a + b, 0);
+    }
+    let count = 0;
+    const days = new Date(anno, mese, 0).getDate();
+    for (let d = 1; d <= days; d++) {
+      const dow = new Date(anno, mese - 1, d).getDay();
+      if (dow !== 0 && dow !== 6) count++;
+    }
+    return count;
+  }
+
 }

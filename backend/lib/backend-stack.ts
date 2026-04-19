@@ -47,6 +47,7 @@ export class BackendStack extends cdk.Stack {
       'cognito-idp:AdminGetUser',
       'cognito-idp:AdminUpdateUserAttributes',
       'cognito-idp:AdminDeleteUser',
+      'cognito-idp:AdminResetUserPassword',
     );
     dynamo.webAuthnTable.grantReadWriteData(usersHandler);
 
@@ -78,8 +79,8 @@ export class BackendStack extends cdk.Stack {
       environment: {
         STAZIONI_TABLE_NAME:   dynamo.stazioniTable.tableName,
         TIMBRATURE_TABLE_NAME: dynamo.timbratureTable.tableName,
-        JWT_SECRET: jwtSecret,
-        APP_URL:    appUrl,
+        JWT_SECRET:            jwtSecret,
+        APP_URL:               appUrl,
       },
     });
     dynamo.stazioniTable.grantReadWriteData(stazioniHandler);
@@ -106,7 +107,20 @@ export class BackendStack extends cdk.Stack {
     // Permesso per leggere nome/cognome del dipendente da Cognito al momento della timbratura
     cognito.userPool.grant(timbratureHandler, 'cognito-idp:AdminGetUser');
 
-    // Lambda per le richieste di timbratura manuale
+    // Lambda per la gestione dei contratti di lavoro
+    const contractsHandler = new NodejsFunction(this, 'ContractsHandler', {
+      runtime: Runtime.NODEJS_22_X,
+      entry:   path.join(__dirname, 'lambda/contracts-handler.ts'),
+      handler: 'handler',
+      environment: {
+        CONTRACTS_TABLE_NAME: dynamo.contractsTable.tableName,
+        USER_POOL_ID:         cognito.userPool.userPoolId,
+      },
+    });
+    dynamo.contractsTable.grantReadWriteData(contractsHandler);
+    cognito.userPool.grant(contractsHandler, 'cognito-idp:AdminGetUser');
+
+    // Lambda per le richieste di timbratura manuale e reset biometria
     const requestsHandler = new NodejsFunction(this, 'RequestsHandler', {
       runtime: Runtime.NODEJS_22_X,
       entry:   path.join(__dirname, 'lambda/requests-handler.ts'),
@@ -114,12 +128,17 @@ export class BackendStack extends cdk.Stack {
       environment: {
         REQUESTS_TABLE_NAME:   dynamo.requestsTable.tableName,
         TIMBRATURE_TABLE_NAME: dynamo.timbratureTable.tableName,
+        WEBAUTHN_TABLE_NAME:   dynamo.webAuthnTable.tableName,
         USER_POOL_ID:          cognito.userPool.userPoolId,
       },
     });
     dynamo.requestsTable.grantReadWriteData(requestsHandler);
     dynamo.timbratureTable.grantReadWriteData(requestsHandler);
-    cognito.userPool.grant(requestsHandler, 'cognito-idp:AdminGetUser');
+    dynamo.webAuthnTable.grantReadWriteData(requestsHandler);
+    cognito.userPool.grant(requestsHandler,
+      'cognito-idp:AdminGetUser',
+      'cognito-idp:AdminUpdateUserAttributes',
+    );
 
     // API Gateway
     const api = new ApiConfig(this, 'Api', { userPool: cognito.userPool, appUrl });
@@ -129,5 +148,6 @@ export class BackendStack extends cdk.Stack {
     api.addStazioniRoutes(stazioniHandler);
     api.addTimbratureRoutes(timbratureHandler);
     api.addRequestsRoutes(requestsHandler);
+    api.addContractsRoutes(contractsHandler);
   }
 }

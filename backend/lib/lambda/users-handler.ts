@@ -6,6 +6,7 @@ import {
   AdminGetUserCommand,
   AdminUpdateUserAttributesCommand,
   AdminDeleteUserCommand,
+  AdminResetUserPasswordCommand,
   ListUsersCommand,
 } from '@aws-sdk/client-cognito-identity-provider';
 import { DynamoDBClient, QueryCommand, DeleteItemCommand } from '@aws-sdk/client-dynamodb';
@@ -52,17 +53,27 @@ export const handler = async (event: APIGatewayProxyEvent) => {
 
   if (!isManagerClaims(claims)) return json(403, 'Accesso negato');
 
+  // POST /users/{id}/reset-password — manager invia password temporanea via email
+  if (event.httpMethod === 'POST' && event.resource === '/users/{id}/reset-password' && userId) {
+    return await resetPassword(userId, claims);
+  }
+
+  // POST /users/{id}/reset-biometrics — manager resetta direttamente le credenziali biometriche
+  if (event.httpMethod === 'POST' && event.resource === '/users/{id}/reset-biometrics' && userId) {
+    return await resetBiometrics(userId, claims);
+  }
+
   switch (event.httpMethod) {
-    case 'POST':   return await createEmployee(event);
+    case 'POST':   return await createEmployee(event, claims);
     case 'GET':    return userId ? await getEmployee(userId) : await listEmployees();
-    case 'PUT':    return userId ? await updateEmployee(userId, event) : json(400, 'Id mancante');
-    case 'DELETE': return userId ? await deleteEmployee(userId) : json(400, 'Id mancante');
+    case 'PUT':    return userId ? await updateEmployee(userId, event, claims) : json(400, 'Id mancante');
+    case 'DELETE': return userId ? await deleteEmployee(userId, claims) : json(400, 'Id mancante');
     default:       return json(405, 'Metodo non supportato');
   }
 };
 
 // --- POST /users — crea un nuovo dipendente ---
-async function createEmployee(event: APIGatewayProxyEvent) {
+async function createEmployee(event: APIGatewayProxyEvent, claims: any) {
   if (!event.body) return json(400, 'Body mancante');
 
   const raw = JSON.parse(event.body);
@@ -71,8 +82,6 @@ async function createEmployee(event: APIGatewayProxyEvent) {
   const cognome         = raw.cognome;
   const birthdate       = raw.birthdate;
   const codice_fiscale  = raw.codice_fiscale?.trim().toUpperCase();
-  const data_assunzione = raw.data_assunzione;
-  const termine_contratto = raw.termine_contratto;
   const ruolo           = raw.ruolo;
 
   if (!email || !nome || !cognome) {
@@ -96,8 +105,6 @@ async function createEmployee(event: APIGatewayProxyEvent) {
         { Name: 'email_verified',           Value: 'true' },
         { Name: 'birthdate',                Value: birthdate         ?? '' },
         { Name: 'custom:codice_fiscale',    Value: codice_fiscale    ?? '' },
-        { Name: 'custom:data_assunzione',   Value: data_assunzione   ?? '' },
-        { Name: 'custom:termine_contratto', Value: termine_contratto ?? '' },
         { Name: 'custom:password_changed',  Value: 'false' },
         { Name: 'custom:biometrics_reg',    Value: 'false' },
       ],
@@ -145,7 +152,7 @@ async function getEmployee(userId: string) {
 }
 
 // --- PUT /users/{id} — modifica attributi di un dipendente ---
-async function updateEmployee(userId: string, event: APIGatewayProxyEvent) {
+async function updateEmployee(userId: string, event: APIGatewayProxyEvent, claims: any) {
   if (!event.body) return json(400, 'Body mancante');
 
   const raw = JSON.parse(event.body);
@@ -153,8 +160,6 @@ async function updateEmployee(userId: string, event: APIGatewayProxyEvent) {
   const cognome           = raw.cognome;
   const birthdate         = raw.birthdate;
   const codice_fiscale    = raw.codice_fiscale?.trim().toUpperCase();
-  const data_assunzione   = raw.data_assunzione;
-  const termine_contratto = raw.termine_contratto;
 
   try {
     await cognitoClient.send(new AdminUpdateUserAttributesCommand({
@@ -165,11 +170,62 @@ async function updateEmployee(userId: string, event: APIGatewayProxyEvent) {
         { Name: 'family_name',              Value: cognome           ?? '' },
         { Name: 'birthdate',                Value: birthdate         ?? '' },
         { Name: 'custom:codice_fiscale',    Value: codice_fiscale    ?? '' },
-        { Name: 'custom:data_assunzione',   Value: data_assunzione   ?? '' },
-        { Name: 'custom:termine_contratto', Value: termine_contratto ?? '' },
       ],
     }));
     return json(200, { message: 'Dipendente aggiornato' });
+  } catch (err: any) {
+    const { status, message } = cognitoErrorToHttp(err);
+    return json(status, message);
+  }
+}
+
+// --- POST /users/{id}/reset-password — manager invia password temporanea via email ---
+async function resetPassword(userId: string, claims: any) {
+  try {
+    // Cognito invia automaticamente email con password temporanea e forza il cambio al prossimo login
+    await cognitoClient.send(new AdminResetUserPasswordCommand({
+      UserPoolId: USER_POOL_ID,
+      Username:   userId,
+    }));
+    // Resetta il flag custom — al prossimo login l'onboardingGuard forza il cambio password
+    await cognitoClient.send(new AdminUpdateUserAttributesCommand({
+      UserPoolId:     USER_POOL_ID,
+      Username:       userId,
+      UserAttributes: [{ Name: 'custom:password_changed', Value: 'false' }],
+    }));
+    return json(200, { message: 'Password temporanea inviata per email' });
+  } catch (err: any) {
+    const { status, message } = cognitoErrorToHttp(err);
+    return json(status, message);
+  }
+}
+
+// --- POST /users/{id}/reset-biometrics — manager resetta direttamente le credenziali biometriche ---
+async function resetBiometrics(userId: string, claims: any) {
+  try {
+    // 1. Cancella tutte le credenziali WebAuthn dell'utente
+    const result = await dynamoClient.send(new QueryCommand({
+      TableName: WEBAUTHN_TABLE,
+      IndexName: 'userId-index',
+      KeyConditionExpression: 'userId = :uid',
+      ExpressionAttributeValues: marshall({ ':uid': userId }),
+    }));
+    const credentials = (result.Items ?? []).map(i => unmarshall(i));
+    await Promise.all(credentials.map(c =>
+      dynamoClient.send(new DeleteItemCommand({
+        TableName: WEBAUTHN_TABLE,
+        Key: marshall({ credentialId: c.credentialId }),
+      }))
+    ));
+
+    // 2. Resetta il flag — al prossimo login l'utente viene rimandato a /first-access
+    await cognitoClient.send(new AdminUpdateUserAttributesCommand({
+      UserPoolId:     USER_POOL_ID,
+      Username:       userId,
+      UserAttributes: [{ Name: 'custom:biometrics_reg', Value: 'false' }],
+    }));
+
+    return json(200, { message: 'Biometria resettata' });
   } catch (err: any) {
     const { status, message } = cognitoErrorToHttp(err);
     return json(status, message);
@@ -213,7 +269,7 @@ async function markPasswordChanged(claims: any) {
 }
 
 // --- DELETE /users/{id} — elimina un dipendente e i suoi dispositivi biometrici ---
-async function deleteEmployee(userId: string) {
+async function deleteEmployee(userId: string, claims: any) {
   try {
     // 1. Elimina l'utente da Cognito
     await cognitoClient.send(new AdminDeleteUserCommand({

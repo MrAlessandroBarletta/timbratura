@@ -1,7 +1,7 @@
 import { APIGatewayProxyEvent } from 'aws-lambda';
-import { DynamoDBClient, PutItemCommand, QueryCommand, GetItemCommand, UpdateItemCommand } from '@aws-sdk/client-dynamodb';
+import { DynamoDBClient, PutItemCommand, QueryCommand, GetItemCommand, UpdateItemCommand, DeleteItemCommand } from '@aws-sdk/client-dynamodb';
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
-import { CognitoIdentityProviderClient, AdminGetUserCommand } from '@aws-sdk/client-cognito-identity-provider';
+import { CognitoIdentityProviderClient, AdminGetUserCommand, AdminUpdateUserAttributesCommand } from '@aws-sdk/client-cognito-identity-provider';
 import { v4 as uuidv4 } from 'uuid';
 import { getJwtClaims, isManagerClaims } from './auth';
 
@@ -9,6 +9,7 @@ const dynamo           = new DynamoDBClient({});
 const cognito          = new CognitoIdentityProviderClient({});
 const REQUESTS_TABLE   = process.env.REQUESTS_TABLE_NAME!;
 const TIMBRATURE_TABLE = process.env.TIMBRATURE_TABLE_NAME!;
+const WEBAUTHN_TABLE   = process.env.WEBAUTHN_TABLE_NAME!;
 const USER_POOL_ID     = process.env.USER_POOL_ID!;
 
 // Converte una data e un'ora locale italiana (Europe/Rome) in un timestamp ISO UTC.
@@ -37,20 +38,27 @@ export const handler = async (event: APIGatewayProxyEvent) => {
 
   if (httpMethod === 'GET'  && resource === '/requests')                            return await getRequestsPendenti();
   if (httpMethod === 'POST' && resource === '/requests/{id}/approve' && requestId)  return await approvaRequest(requestId, claims);
-  if (httpMethod === 'POST' && resource === '/requests/{id}/reject'  && requestId)  return await rifiutaRequest(requestId, event);
+  if (httpMethod === 'POST' && resource === '/requests/{id}/reject'  && requestId)  return await rifiutaRequest(requestId, event, claims);
 
   return json(404, 'Rotta non trovata');
 };
 
-// --- POST /requests — il dipendente crea una richiesta di timbratura manuale ---
+// --- POST /requests — il dipendente crea una richiesta ---
+// tipoRichiesta = 'timbratura' (default) | 'reset_biometria'
 async function creaRequest(event: APIGatewayProxyEvent, claims: any) {
   if (!event.body) return json(400, 'Body mancante');
-  const { data, tipo, ora, nota } = JSON.parse(event.body);
+  const { data, tipo, ora, nota, tipoRichiesta } = JSON.parse(event.body);
 
-  if (!data || !tipo || !ora || !nota?.trim())
-    return json(400, 'Tutti i campi sono obbligatori: data, tipo, ora, nota');
-  if (!['entrata', 'uscita'].includes(tipo))
-    return json(400, 'Tipo non valido: deve essere entrata o uscita');
+  const isResetBiometria = tipoRichiesta === 'reset_biometria';
+
+  if (isResetBiometria) {
+    if (!nota?.trim()) return json(400, 'La nota è obbligatoria');
+  } else {
+    if (!data || !tipo || !ora || !nota?.trim())
+      return json(400, 'Tutti i campi sono obbligatori: data, tipo, ora, nota');
+    if (!['entrata', 'uscita'].includes(tipo))
+      return json(400, 'Tipo non valido: deve essere entrata o uscita');
+  }
 
   const userId = claims['cognito:username'];
   let nomeUtente = '';
@@ -60,21 +68,22 @@ async function creaRequest(event: APIGatewayProxyEvent, claims: any) {
     nomeUtente = `${attrs['given_name'] ?? ''} ${attrs['family_name'] ?? ''}`.trim();
   } catch {}
 
-  await dynamo.send(new PutItemCommand({
-    TableName: REQUESTS_TABLE,
-    Item: marshall({
-      requestId: uuidv4(),
-      userId,
-      nomeUtente,
-      data,
-      tipo,
-      ora,
-      nota:      nota.trim(),
-      stato:     'pendente',
-      createdAt: new Date().toISOString(),
-    }),
-  }));
+  const item: Record<string, any> = {
+    requestId:     uuidv4(),
+    userId,
+    nomeUtente,
+    nota:          nota.trim(),
+    stato:         'pendente',
+    tipoRichiesta: tipoRichiesta ?? 'timbratura',
+    createdAt:     new Date().toISOString(),
+  };
+  if (!isResetBiometria) {
+    item.data = data;
+    item.tipo = tipo;
+    item.ora  = ora;
+  }
 
+  await dynamo.send(new PutItemCommand({ TableName: REQUESTS_TABLE, Item: marshall(item) }));
   return json(201, { message: 'Richiesta inviata' });
 }
 
@@ -109,19 +118,65 @@ async function approvaRequest(requestId: string, claims: any) {
   if (!item) return json(404, 'Richiesta non trovata');
   if (item.stato !== 'pendente') return json(409, 'Richiesta già processata');
 
-  // Verifica che il tipo richiesto sia coerente con l'ultima timbratura del dipendente per quella data
+  // ── Branch: reset biometria ──────────────────────────────────────────────
+  if (item.tipoRichiesta === 'reset_biometria') {
+    // 1. Cancella tutte le credenziali WebAuthn del dipendente
+    const credsResult = await dynamo.send(new QueryCommand({
+      TableName:              WEBAUTHN_TABLE,
+      IndexName:              'userId-index',
+      KeyConditionExpression: 'userId = :uid',
+      ExpressionAttributeValues: marshall({ ':uid': item.userId }),
+    }));
+    const credentials = (credsResult.Items ?? []).map(i => unmarshall(i));
+    await Promise.all(credentials.map(c =>
+      dynamo.send(new DeleteItemCommand({
+        TableName: WEBAUTHN_TABLE,
+        Key:       marshall({ credentialId: c.credentialId }),
+      }))
+    ));
+
+    // 2. Resetta il flag biometria — al prossimo login l'utente viene rimandato a /first-access
+    await cognito.send(new AdminUpdateUserAttributesCommand({
+      UserPoolId:     USER_POOL_ID,
+      Username:       item.userId,
+      UserAttributes: [{ Name: 'custom:biometrics_reg', Value: 'false' }],
+    }));
+
+    // 3. Aggiorna stato richiesta
+    await dynamo.send(new UpdateItemCommand({
+      TableName: REQUESTS_TABLE,
+      Key: marshall({ requestId }),
+      UpdateExpression: 'SET stato = :s, approvataDa = :m, approvataAt = :t',
+      ExpressionAttributeValues: marshall({
+        ':s': 'approvata',
+        ':m': claims['cognito:username'],
+        ':t': new Date().toISOString(),
+      }),
+    }));
+
+    return json(200, { message: 'Biometria resettata' });
+  }
+
+  // ── Branch: timbratura manuale ───────────────────────────────────────────
+
+  // Calcola il timestamp UTC della timbratura richiesta (usato sia per la query che per il salvataggio)
+  const timestamp = oraLocaleToIsoUtc(item.data, item.ora);
+
+  // Verifica che il tipo sia coerente con l'ultima timbratura PRIMA dell'orario richiesto.
+  // Usa il timestamp calcolato come limite superiore per gestire correttamente le timbrature
+  // inserite nel passato quando esistono già eventi successivi nello stesso giorno.
   const ultimaResult = await dynamo.send(new QueryCommand({
     TableName:              TIMBRATURE_TABLE,
-    KeyConditionExpression: 'userId = :uid AND begins_with(#ts, :data)',
+    KeyConditionExpression: 'userId = :uid AND #ts < :ts',
     ExpressionAttributeNames:  { '#ts': 'timestamp' },
-    ExpressionAttributeValues: marshall({ ':uid': item.userId, ':data': item.data }),
+    ExpressionAttributeValues: marshall({ ':uid': item.userId, ':ts': timestamp }),
     ScanIndexForward: false,
     Limit: 1,
   }));
   const ultima = ultimaResult.Items?.[0] ? unmarshall(ultimaResult.Items[0]) : null;
   const tipoAtteso = (!ultima || ultima.tipo === 'uscita') ? 'entrata' : 'uscita';
   if (item.tipo !== tipoAtteso)
-    return json(409, `Tipo non coerente: per questo dipendente la prossima timbratura del ${item.data} deve essere una ${tipoAtteso}`);
+    return json(409, `Tipo non coerente: prima di questo orario l'ultima timbratura è una ${ultima?.tipo ?? '—'}, quindi la successiva deve essere una ${tipoAtteso}`);
 
   // Recupera nome e cognome per salvarlo nella timbratura (evita join successivi)
   let nome = '', cognome = '';
@@ -131,8 +186,6 @@ async function approvaRequest(requestId: string, claims: any) {
     nome    = attrs['given_name']  ?? '';
     cognome = attrs['family_name'] ?? '';
   } catch {}
-
-  const timestamp = oraLocaleToIsoUtc(item.data, item.ora);
   await dynamo.send(new PutItemCommand({
     TableName: TIMBRATURE_TABLE,
     Item: marshall({
@@ -161,7 +214,7 @@ async function approvaRequest(requestId: string, claims: any) {
 }
 
 // --- POST /requests/{id}/reject — il manager rifiuta con motivo obbligatorio ---
-async function rifiutaRequest(requestId: string, event: APIGatewayProxyEvent) {
+async function rifiutaRequest(requestId: string, event: APIGatewayProxyEvent, claims: any) {
   if (!event.body) return json(400, 'Body mancante');
   const { motivo } = JSON.parse(event.body);
   if (!motivo?.trim()) return json(400, 'Il motivo del rifiuto è obbligatorio');
@@ -183,6 +236,7 @@ async function rifiutaRequest(requestId: string, event: APIGatewayProxyEvent) {
   return json(200, { message: 'Richiesta rifiutata' });
 }
 
+// --- Funzione di utilità per recuperare una richiesta per ID ---
 async function getItem(requestId: string) {
   const result = await dynamo.send(new GetItemCommand({
     TableName: REQUESTS_TABLE,

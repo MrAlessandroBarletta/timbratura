@@ -35,17 +35,17 @@ export const handler = async (event: APIGatewayProxyEvent) => {
   const claims = getJwtClaims(event);
   if (!isManagerClaims(claims)) return json(403, 'Accesso negato');
 
-  if (httpMethod === 'POST'   && resource === '/stazioni')       return await createStazione(event);
+  if (httpMethod === 'POST'   && resource === '/stazioni')       return await createStazione(event, claims);
   if (httpMethod === 'GET'    && resource === '/stazioni')       return await listStazioni();
   if (httpMethod === 'GET'    && resource === '/stazioni/{id}')  return await getStazioneDettaglio(event.pathParameters?.id!);
-  if (httpMethod === 'DELETE' && resource === '/stazioni/{id}')  return await deleteStazione(event.pathParameters?.id!);
+  if (httpMethod === 'DELETE' && resource === '/stazioni/{id}')  return await deleteStazione(event.pathParameters?.id!, claims);
 
   return json(404, 'Rotta non trovata');
 };
 
 // --- POST /stazioni — crea una nuova stazione (manager) ---
 // Il manager fornisce descrizione e password; il codice è generato automaticamente
-async function createStazione(event: APIGatewayProxyEvent) {
+async function createStazione(event: APIGatewayProxyEvent, claims: any) {
   if (!event.body) return json(400, 'Body mancante');
 
   const { descrizione, password } = JSON.parse(event.body);
@@ -120,11 +120,12 @@ async function getStazioneDettaglio(stationId: string) {
 }
 
 // --- DELETE /stazioni/{id} — elimina una stazione (manager) ---
-async function deleteStazione(stationId: string) {
+async function deleteStazione(stationId: string, claims: any) {
   await dynamo.send(new DeleteItemCommand({
     TableName: TABLE_NAME,
     Key: marshall({ stationId }),
   }));
+
   return json(200, { message: 'Stazione eliminata' });
 }
 
